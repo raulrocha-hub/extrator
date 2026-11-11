@@ -13,6 +13,7 @@ from urllib.parse import quote
 import requests
 import pandas as pd
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
@@ -65,7 +66,7 @@ def init_db():
 def salvar_lead(conn, lead, cidade, nicho):
     try:
         conn.execute(
-            """INSERT INTO leads (nome, email, whatsapp, telefone, endereco, cidade, nicho, site, link_whatsapp)
+            """INSERT INTO leads (nome, email, whatsapp, telefone, endereco, cidade, nicho, site, link_whatsapp, pagina_contato)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 (lead.get("nome") or "").strip(),
@@ -88,39 +89,66 @@ def salvar_lead(conn, lead, cidade, nicho):
 # EXTRAÇÃO DO SITE (WhatsApp + E-mail)
 # =========================================================
 def extrair_contatos_do_site(site_url: str):
-    whatsapp, email = "", ""
+    """Extrai WhatsApp, E-mail e o link da Página de Contato."""
+    whatsapp, email, pagina_contato = "", "", ""
     if not site_url:
-        return whatsapp, email
+        return whatsapp, email, pagina_contato
         
     try:
         resp = requests.get(site_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         html = resp.text
+        site_base = site_url.rstrip('/')
         
-        # 1. WhatsApp
-        padroes_wa = [
-            r"wa\.me/(\d{10,15})",
-            r"api\.whatsapp\.com/send\?phone=(\d{10,15})",
-            r"web\.whatsapp\.com/send\?phone=(\d{10,15})",
-        ]
+        # Função interna para buscar e-mail no HTML
+        def buscar_email(texto_html):
+            emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', texto_html)
+            for e in emails:
+                e_lower = e.lower()
+                # Ignora imagens e e-mails de bibliotecas
+                if not any(x in e_lower for x in [".png", ".jpg", ".jpeg", ".gif", ".svg", "example.com", "sentry.io", "wixpress.com", "domain.com"]):
+                    return e
+            return ""
+
+        # 1. Busca WhatsApp
+        padroes_wa = [r"wa\.me/(\d{10,15})", r"api\.whatsapp\.com/send\?phone=(\d{10,15})"]
         for padrao in padroes_wa:
             match = re.search(padrao, html)
             if match:
                 whatsapp = match.group(1)
                 break
                 
-        # 2. E-mail
-        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
-        if emails:
-            for e in emails:
-                e_lower = e.lower()
-                if not any(x in e_lower for x in [".png", ".jpg", ".jpeg", ".gif", ".svg", "example.com", "sentry.io", "wixpress.com"]):
-                    email = e
-                    break
+        # 2. Busca E-mail na página inicial
+        email = buscar_email(html)
+        
+        # 3. Busca link de Contato (se não achou e-mail ainda)
+        if not email:
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                texto_link = a.text.lower()
+                href_link = a["href"].lower()
+                # Procura palavras comuns de contato
+                if any(termo in texto_link or termo in href_link for termo in ["contato", "fale-conosco", "faleconosco", "contact", "atendimento"]):
+                    # Monta a URL completa
+                    if href_link.startswith("http"):
+                        pagina_contato = a["href"]
+                    else:
+                        pagina_contato = f"{site_base}/{a['href'].lstrip('/')}"
+                    break # Achou o link, para de procurar
+            
+            # Se achou a página de contato, entra nela para buscar o e-mail lá
+            if pagina_contato:
+                try:
+                    resp_contato = requests.get(pagina_contato, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                    if resp_contato.status_code == 200:
+                        email = buscar_email(resp_contato.text)
+                except Exception:
+                    pass
+                    
     except Exception:
         pass
         
-    return whatsapp, email
+    return whatsapp, email, pagina_contato
 
 def normalizar_telefone_br(phone: str) -> str:
     if not phone: return ""
@@ -206,7 +234,7 @@ def scrape_leads(tipo_busca: str, cidade: str, mensagem_template: str, max_resul
             continue
             
         # Tenta pegar WhatsApp e E-mail
-        whatsapp, email = extrair_contatos_do_site(site)
+        whatsapp, email, pagina_contato = extrair_contatos_do_site(site)
 
         # Fallback de WhatsApp
         if not whatsapp and telefone:
@@ -225,6 +253,7 @@ def scrape_leads(tipo_busca: str, cidade: str, mensagem_template: str, max_resul
             "endereco": endereco,
             "site": site,
             "link_whatsapp": link_wa,
+            "pagina_contato": pagina_contato,
         }
         leads.append(lead)
         
@@ -262,7 +291,7 @@ def processar(nicho: dict, cidade: str, max_resultados: int):
 def exportar_csv():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
-        "SELECT nome, whatsapp, email, telefone, endereco, cidade, nicho, link_whatsapp FROM leads ORDER BY id",
+        "SELECT nome, whatsapp, email, telefone, endereco, cidade, nicho, link_whatsapp, pagina_contato FROM leads ORDER BY id",
         conn,
     )
     conn.close()
@@ -284,21 +313,34 @@ def menu_interativo():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extração de leads + links WhatsApp")
-    parser.add_argument("--nicho", help="Chave do nicho (ex: pizzarias)")
+    parser.add_argument("--nicho", help="Tipo de comércio (ex: pizzarias, confeitaria, choperia)")
     parser.add_argument("--cidade", help="Cidade (ex: 'Americana - SP')")
     parser.add_argument("--max", type=int, default=50, help="Máx. de resultados")
     args = parser.parse_args()
 
+    # Lógica para aceitar nichos personalizados
     if args.nicho:
-        matches = [v for v in NICHOS.values() if v["key"] == args.nicho]
-        if not matches:
-            print(f"Nicho inválido.")
-            raise SystemExit(1)
-        nicho = matches[0]
+        nicho_digitado = args.nicho.lower().strip()
+        
+        # Tenta achar na lista pré-definida
+        matches = [v for v in NICHOS.values() if v["key"] == nicho_digitado or v["search"] == nicho_digitado]
+        
+        if matches:
+            nicho = matches[0]
+        else:
+            # Se não achou, cria um nicho "na hora" com uma mensagem genérica
+            print(f"[Aviso] Nicho '{nicho_digitado}' não está no menu pré-definido. Usando mensagem genérica e buscando no Google Maps...")
+            nicho = {
+                "key": nicho_digitado,
+                "label": nicho_digitado.capitalize(),
+                "search": nicho_digitado,
+                "mensagem": f"Olá! Tudo bem? Vi o {{nome}} em {{cidade}}. Sou [SEU NOME], da QuickScanMenu. Trabalho com PDV e cardápio digital para {nicho_digitado}. Posso te mostrar como funciona?"
+            }
     else:
+        # Se não passar --nicho, abre o menu interativo
         nicho = menu_interativo()
 
-    cidade = args.cidade or input("Cidade: ").strip()
+    cidade = args.cidade or input("Cidade (ex: Americana - SP): ").strip()
     if not cidade:
         raise SystemExit(1)
 
