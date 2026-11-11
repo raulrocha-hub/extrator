@@ -1,11 +1,12 @@
 """
 QuickScanMenu – Extração de leads + geração de links WhatsApp
-Fluxo: Bolt Scraper (API REST) → SQLite → CSV com links wa.me personalizados
+Fluxo: Bolt Scraper (API REST com Paginação) → SQLite → CSV com links wa.me
 """
 import os
 import re
 import sqlite3
 import argparse
+import math
 from pathlib import Path
 from urllib.parse import quote
 
@@ -41,7 +42,6 @@ NICHOS = {
 # =========================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    # MUDANÇA AQUI: UNIQUE agora é (nome, cidade) para evitar duplicatas na mesma cidade
     conn.execute("""
         CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,8 +64,7 @@ def init_db():
 
 def salvar_lead(conn, lead, cidade, nicho):
     try:
-        cursor = conn.cursor()
-        cursor.execute(
+        conn.execute(
             """INSERT INTO leads (nome, email, whatsapp, telefone, endereco, cidade, nicho, site, link_whatsapp)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
@@ -81,26 +80,24 @@ def salvar_lead(conn, lead, cidade, nicho):
             ),
         )
         conn.commit()
-        return True # Sucesso
+        return True
     except sqlite3.IntegrityError:
-        return False # Duplicado (já existe com esse nome nessa cidade)
+        return False
 
 # =========================================================
 # EXTRAÇÃO DO SITE (WhatsApp + E-mail)
 # =========================================================
 def extrair_contatos_do_site(site_url: str):
-    """Visita o site, extrai o primeiro WhatsApp e o primeiro E-mail válido."""
     whatsapp, email = "", ""
     if not site_url:
         return whatsapp, email
         
     try:
-        # Timeout curto para não travar
         resp = requests.get(site_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         html = resp.text
         
-        # 1. Extração de WhatsApp
+        # 1. WhatsApp
         padroes_wa = [
             r"wa\.me/(\d{10,15})",
             r"api\.whatsapp\.com/send\?phone=(\d{10,15})",
@@ -112,17 +109,14 @@ def extrair_contatos_do_site(site_url: str):
                 whatsapp = match.group(1)
                 break
                 
-        # 2. Extração de E-mail
-        # Busca qualquer coisa que pareça e-mail
-        emails_encontrados = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
-        if emails_encontrados:
-            # Filtra lixos comuns (imagens, bibliotecas, exemplos)
-            for e in emails_encontrados:
+        # 2. E-mail
+        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
+        if emails:
+            for e in emails:
                 e_lower = e.lower()
                 if not any(x in e_lower for x in [".png", ".jpg", ".jpeg", ".gif", ".svg", "example.com", "sentry.io", "wixpress.com"]):
                     email = e
-                    break # Pega o primeiro válido
-                    
+                    break
     except Exception:
         pass
         
@@ -142,7 +136,7 @@ def gerar_link_wa(whatsapp: str, mensagem: str) -> str:
     return f"https://wa.me/{numero}?text={quote(mensagem)}"
 
 # =========================================================
-# SCRAPING (CHAMADA REST DIRETA)
+# SCRAPING (API REST COM PAGINAÇÃO)
 # =========================================================
 def scrape_leads(tipo_busca: str, cidade: str, mensagem_template: str, max_resultados: int = 50):
     if not BOLT_API_KEY:
@@ -157,63 +151,84 @@ def scrape_leads(tipo_busca: str, cidade: str, mensagem_template: str, max_resul
     
     cidade_limpa = cidade.replace(" - ", " ").replace("-", " ")
     query = f"{tipo_busca} {cidade_limpa}"
-    payload = {"query": query, "limit": max_resultados}
+    
+    paginas_necessarias = math.ceil(max_resultados / 20)
+    print(f"[Scraping] Alvo: {max_resultados} leads. O Google Maps retorna 20 por vez. Buscando {paginas_necessarias} página(s)...")
 
-    print(f"[Scraping] Chamando API do Bolt para: '{query}'")
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=45)
+    leads_brutos = []
+    
+    for pagina in range(1, paginas_necessarias + 1):
+        payload = {"query": query, "page": pagina}
         
-        if response.status_code != 200:
-            print(f"[Erro API] Status {response.status_code}: {response.text}")
-            return []
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=45)
             
-        data = response.json()
-        results = data.get("data") or data.get("results") or []
-        if not results and isinstance(data, list):
-            results = data
-
-        print(f"[Scraping] API retornou {len(results)} resultados brutos. Filtrando até {max_resultados}...")
-        
-        leads = []
-        # FATIANDO A LISTA AQUI para respeitar o max
-        for place in results[:max_resultados]:
-            nome = place.get("Name") or place.get("name") or place.get("title") or ""
-            site = place.get("Website") or place.get("website") or ""
-            telefone = place.get("Phone") or place.get("phone") or ""
-            endereco = place.get("Full Address") or place.get("address") or place.get("full_address") or ""
-            
-            if not nome:
-                continue
+            if response.status_code != 200:
+                print(f"[Erro API] Status {response.status_code} na página {pagina}: {response.text}")
+                break
                 
-            # Tenta pegar WhatsApp e E-mail no site
-            whatsapp, email = extrair_contatos_do_site(site)
+            try:
+                data = response.json()
+            except ValueError:
+                print(f"[Erro] A API não retornou JSON válido na página {pagina}.")
+                break
+                
+            results_pagina = data.get("data") or data.get("results") or []
+            if not results_pagina and isinstance(data, list):
+                results_pagina = data
 
-            # Fallback: se não achou WhatsApp no site, usa o telefone do Maps
-            if not whatsapp and telefone:
-                digits = re.sub(r"\D", "", telefone)
-                if len(digits) >= 10 and len(digits) <= 11:
-                    whatsapp = telefone
-
-            mensagem = mensagem_template.format(nome=nome, cidade=cidade)
-            link_wa = gerar_link_wa(whatsapp, mensagem) if whatsapp else ""
-
-            lead = {
-                "nome": nome,
-                "email": email,
-                "whatsapp": whatsapp,
-                "telefone": telefone,
-                "endereco": endereco,
-                "site": site,
-                "link_whatsapp": link_wa,
-            }
-            leads.append(lead)
+            print(f"  -> Página {pagina}: {len(results_pagina)} resultados encontrados.")
             
-        return leads
+            if not results_pagina:
+                print("  -> Fim dos resultados no Google Maps.")
+                break 
+                
+            leads_brutos.extend(results_pagina)
+            
+            if len(leads_brutos) >= max_resultados:
+                break
+                
+        except requests.exceptions.RequestException as e:
+            print(f"[Erro de Conexão] na página {pagina}: {e}")
+            break
 
-    except requests.exceptions.RequestException as e:
-        print(f"[Erro de Conexão] {e}")
-        return []
+    resultados_finais = leads_brutos[:max_resultados]
+    print(f"[Scraping] Total final para processar: {len(resultados_finais)} leads.")
+        
+    leads = []
+    for place in resultados_finais:
+        nome = place.get("Name") or place.get("name") or place.get("title") or ""
+        site = place.get("Website") or place.get("website") or ""
+        telefone = place.get("Phone") or place.get("phone") or ""
+        endereco = place.get("Full Address") or place.get("address") or place.get("full_address") or ""
+        
+        if not nome:
+            continue
+            
+        # Tenta pegar WhatsApp e E-mail
+        whatsapp, email = extrair_contatos_do_site(site)
+
+        # Fallback de WhatsApp
+        if not whatsapp and telefone:
+            digits = re.sub(r"\D", "", telefone)
+            if len(digits) >= 10 and len(digits) <= 11:
+                whatsapp = telefone
+
+        mensagem = mensagem_template.format(nome=nome, cidade=cidade)
+        link_wa = gerar_link_wa(whatsapp, mensagem) if whatsapp else ""
+
+        lead = {
+            "nome": nome,
+            "email": email,
+            "whatsapp": whatsapp,
+            "telefone": telefone,
+            "endereco": endereco,
+            "site": site,
+            "link_whatsapp": link_wa,
+        }
+        leads.append(lead)
+        
+    return leads
 
 # =========================================================
 # FLUXO PRINCIPAL
@@ -233,7 +248,6 @@ def processar(nicho: dict, cidade: str, max_resultados: int):
     com_email = 0
     
     for lead in leads:
-        # A função salvar_lead agora retorna True (salvou) ou False (duplicado)
         if salvar_lead(conn, lead, cidade, nicho["key"]):
             salvos += 1
             if lead.get("whatsapp"): com_whatsapp += 1
